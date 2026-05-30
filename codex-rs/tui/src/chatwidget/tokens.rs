@@ -28,7 +28,11 @@ use crate::terminal_palette::default_bg;
 use crate::terminal_palette::default_fg;
 use crate::terminal_palette::stdout_color_level;
 
-const EMPTY_CELL_GLYPH: &str = "∎";
+// In low-color terminals we distinguish empty vs active cells by glyph (a
+// width-matched filled/hollow pair). In truecolor terminals the grid uses a
+// single glyph and lets color carry the intensity (GitHub-style), which keeps
+// the grid perfectly aligned and free of texture noise.
+const EMPTY_CELL_GLYPH: &str = "□";
 const ACTIVE_CELL_GLYPH: &str = "■";
 const WEEK_COUNT: usize = 52;
 const DAY_COUNT: usize = 7;
@@ -140,7 +144,13 @@ impl TokenActivityHistoryCell {
         response: &GetAccountTokenUsageResponse,
         width: u16,
     ) -> Vec<Line<'static>> {
-        let mut lines = vec![" Token activity".bold().into()];
+        let mut lines = vec![
+            vec![
+                Span::from(" Token activity").bold(),
+                Span::styled("   last 12 months", label_style()),
+            ]
+            .into(),
+        ];
         lines.extend(summary_lines(response, graph_width(width)));
         let Some(buckets) = response.daily_usage_buckets.as_ref() else {
             lines.push("   Token activity history unavailable".dim().into());
@@ -186,12 +196,18 @@ impl TokenActivityHistoryCell {
                     } else {
                         palette.for_bar_level(levels[index])
                     };
-                    spans.push(Span::styled(cell_glyph(levels[index]), style));
+                    spans.push(Span::styled(palette.glyph(levels[index]), style));
                 }
             }
             lines.push(spans.into());
         }
-        lines.push(legend_line(&palette));
+        match self.view {
+            TokenActivityView::Daily => lines.push(legend_line(&palette)),
+            TokenActivityView::Weekly | TokenActivityView::Cumulative => {
+                lines.push(bar_caption(self.view, &values))
+            }
+        }
+        lines.push(view_footer(self.view));
         lines
     }
 }
@@ -217,26 +233,43 @@ fn summary_lines(response: &GetAccountTokenUsageResponse, width: u16) -> Vec<Lin
         ("Lifetime", format_optional_tokens(summary.lifetime_tokens)),
         ("Peak", format_optional_tokens(summary.peak_daily_tokens)),
         (
-            "Current streak",
-            format_optional_days(summary.current_streak_days),
-        ),
-        (
-            "Longest streak",
-            format_optional_days(summary.longest_streak_days),
+            "Streak",
+            format_streak(summary.current_streak_days, summary.longest_streak_days),
         ),
         (
             "Longest turn",
             format_optional_duration(summary.longest_running_turn_sec),
         ),
     ];
-    let line = summary_line(&fields, &[0, 1, 2, 3, 4]);
-    if line.width() <= usize::from(width) || width == u16::MAX {
-        return vec![center_summary_line(line, width)];
+    pack_fields(&fields, width)
+        .into_iter()
+        .map(|group| center_summary_line(summary_line(&fields, &group), width))
+        .collect()
+}
+
+/// Greedily pack summary fields into as few centered lines as fit `width`,
+/// keeping field order. `u16::MAX` (raw/copy mode) always yields one line.
+fn pack_fields(fields: &[(&str, String)], width: u16) -> Vec<Vec<usize>> {
+    if width == u16::MAX {
+        return vec![(0..fields.len()).collect()];
     }
-    vec![
-        center_summary_line(summary_line(&fields, &[0, 1, 4]), width),
-        center_summary_line(summary_line(&fields, &[2, 3]), width),
-    ]
+    let max = usize::from(width);
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    for index in 0..fields.len() {
+        let mut candidate = current.clone();
+        candidate.push(index);
+        if !current.is_empty() && summary_line(fields, &candidate).width() > max {
+            groups.push(std::mem::take(&mut current));
+            current.push(index);
+        } else {
+            current = candidate;
+        }
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    groups
 }
 
 fn summary_line(fields: &[(&str, String)], indexes: &[usize]) -> Line<'static> {
@@ -269,19 +302,30 @@ fn format_optional_tokens(value: Option<i64>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn format_optional_days(value: Option<i64>) -> String {
-    value.map_or_else(|| "-".to_string(), |days| format!("{days}d"))
+/// Combine the current and longest streak into one field: a bare `54d` when
+/// they match, otherwise `12d (best 54d)`.
+fn format_streak(current: Option<i64>, longest: Option<i64>) -> String {
+    match (current, longest) {
+        (Some(current), Some(longest)) if current == longest => format!("{current}d"),
+        (Some(current), Some(longest)) => format!("{current}d (best {longest}d)"),
+        (Some(current), None) => format!("{current}d"),
+        (None, Some(longest)) => format!("- (best {longest}d)"),
+        (None, None) => "-".to_string(),
+    }
 }
 
 fn format_optional_duration(value: Option<i64>) -> String {
     value.map_or_else(
         || "-".to_string(),
         |seconds| {
-            let minutes = seconds / 60;
-            if minutes > 0 {
-                format!("{minutes}m")
-            } else {
-                format!("{seconds}s")
+            let seconds = seconds.max(0);
+            let hours = seconds / 3600;
+            let minutes = (seconds % 3600) / 60;
+            match (hours, minutes) {
+                (0, 0) => format!("{seconds}s"),
+                (0, minutes) => format!("{minutes}m"),
+                (hours, 0) => format!("{hours}h"),
+                (hours, minutes) => format!("{hours}h {minutes}m"),
             }
         },
     )
@@ -298,7 +342,16 @@ fn label_style() -> Style {
 
 fn weekday_label(view: TokenActivityView, row: usize) -> Span<'static> {
     if view != TokenActivityView::Daily {
-        return "    ".into();
+        // Bar views fill from the bottom (row 6) upward, so the gutter doubles
+        // as a coarse Y-axis: peak at the top, baseline at the bottom.
+        return Span::styled(
+            match row {
+                0 => "max ",
+                6 => "  0 ",
+                _ => "    ",
+            },
+            label_style(),
+        );
     }
     Span::styled(
         match row {
@@ -321,18 +374,57 @@ fn legend_line(palette: &TokenActivityPalette) -> Line<'static> {
         if level > 0 {
             spans.push(" ".into());
         }
-        spans.push(Span::styled(ACTIVE_CELL_GLYPH, palette.for_level(level)));
+        spans.push(Span::styled(palette.glyph(level), palette.for_level(level)));
     }
     spans.push(Span::styled(" More", label_style()));
     spans.into()
 }
 
-fn cell_glyph(level: usize) -> &'static str {
-    if level == 0 {
-        EMPTY_CELL_GLYPH
-    } else {
-        ACTIVE_CELL_GLYPH
+/// Caption for the bar-chart views, where the 5-step daily legend would be
+/// misleading. States what each bar represents and the peak it is scaled to.
+fn bar_caption(view: TokenActivityView, values: &[i64]) -> Line<'static> {
+    let weeks = weekly_totals(values);
+    let (lead, peak) = match view {
+        TokenActivityView::Weekly => (
+            "Each column = 1 week · tallest ",
+            weeks.iter().copied().max().unwrap_or(0),
+        ),
+        TokenActivityView::Cumulative => {
+            ("Running total · top ", weeks.iter().sum::<i64>())
+        }
+        TokenActivityView::Daily => ("", 0),
+    };
+    if peak <= 0 {
+        return Span::styled("   No token activity in the last 12 months", label_style()).into();
     }
+    vec![
+        Span::styled(format!("   {lead}"), label_style()),
+        Span::styled(format_tokens_compact(peak), numeric_style()),
+    ]
+    .into()
+}
+
+/// Dim footer that surfaces the other `/tokens` views and emphasizes the
+/// active one, so the weekly/cumulative modes are discoverable from the card.
+fn view_footer(active: TokenActivityView) -> Line<'static> {
+    let mut spans = vec![Span::styled("   ", label_style())];
+    let views = [
+        (TokenActivityView::Daily, "daily"),
+        (TokenActivityView::Weekly, "weekly"),
+        (TokenActivityView::Cumulative, "cumulative"),
+    ];
+    for (index, (view, name)) in views.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" · ", label_style()));
+        }
+        let style = if view == active {
+            numeric_style().bold()
+        } else {
+            label_style()
+        };
+        spans.push(Span::styled(name, style));
+    }
+    spans.into()
 }
 
 fn month_labels(today: NaiveDate, first_column: usize, shown_columns: usize) -> Line<'static> {
@@ -452,6 +544,11 @@ fn cell_date(today: NaiveDate, index: usize) -> Option<NaiveDate> {
 struct TokenActivityPalette {
     styles: [Style; 5],
     bar_style: Style,
+    /// True when the terminal supports a truecolor gradient, so the grid can
+    /// encode intensity purely by color and render every cell with a single
+    /// glyph. False on low-color terminals, where we fall back to a
+    /// filled/hollow glyph pair so empty and active cells stay distinguishable.
+    uses_color: bool,
 }
 
 impl TokenActivityPalette {
@@ -464,26 +561,25 @@ impl TokenActivityPalette {
             Style::default().light_green().bold(),
         ];
         let fallback_bar_style = Style::default().light_green();
+        let fallback_palette = || Self {
+            styles: fallback,
+            bar_style: fallback_bar_style,
+            uses_color: false,
+        };
         let (Some(fg), Some(bg), Some(anchor)) = (default_fg(), default_bg(), theme_anchor_rgb())
         else {
-            return Self {
-                styles: fallback,
-                bar_style: fallback_bar_style,
-            };
+            return fallback_palette();
         };
         if matches!(
             stdout_color_level(),
             StdoutColorLevel::Ansi16 | StdoutColorLevel::Unknown
         ) {
-            return Self {
-                styles: fallback,
-                bar_style: fallback_bar_style,
-            };
+            return fallback_palette();
         }
         let empty_alpha = if crate::color::is_light(bg) {
             0.18
         } else {
-            0.10
+            0.14
         };
         let alphas = [empty_alpha, 0.22, 0.42, 0.68, 1.00];
         let styles = std::array::from_fn(|index| {
@@ -495,7 +591,11 @@ impl TokenActivityPalette {
             Style::default().fg(best_color(color))
         });
         let bar_style = Style::default().fg(best_color(blend(anchor, bg, 0.78)));
-        Self { styles, bar_style }
+        Self {
+            styles,
+            bar_style,
+            uses_color: true,
+        }
     }
 
     fn for_level(&self, level: usize) -> Style {
@@ -507,6 +607,17 @@ impl TokenActivityPalette {
             self.for_level(0)
         } else {
             self.bar_style
+        }
+    }
+
+    /// The glyph for a cell at `level`. In truecolor we always use the filled
+    /// glyph and let color carry the intensity; in low-color we use the hollow
+    /// glyph for empty cells so they remain visible without a color gradient.
+    fn glyph(&self, level: usize) -> &'static str {
+        if self.uses_color || level > 0 {
+            ACTIVE_CELL_GLYPH
+        } else {
+            EMPTY_CELL_GLYPH
         }
     }
 }
